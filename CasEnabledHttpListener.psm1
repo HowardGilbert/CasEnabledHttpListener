@@ -126,6 +126,7 @@ function Start-CasEnabledHttpListener {
 		    [System.Net.HttpListenerContext] $global:CasEnabledHttpListenerContext = $context
 
             [System.Net.HttpListenerRequest] $request = $context.Request
+            [System.Uri] $url = $request.Url
 
             # A silly switch. The code runs until it generates a response 
             # a break statement generates HTML text output
@@ -134,34 +135,36 @@ function Start-CasEnabledHttpListener {
             switch ('only case') {
                 'only case' {
 
-                # We want to allow forms we write to the Browser to post back data
-                # But we don't want any other application to Redirect the Browser to a REST Web call
-                # that does something using the logged in user's authority. So we check the 
-                # Http Referrer header, which must be missing (the user typed the URL in himself) or
-                # must be this machine (this data comes from a form we wrote).
-                [System.Uri] $url = $request.Url
-                [System.Uri] $referrer = $request.UrlReferrer
-                if ($referrer -and $url.Authority -ne $referrer.Authority) {
-                    $StatusCode = 403
-                    $commandOutput = "You were redirected from another computer. This is a security problem."
-                    break;
-                } 
             
-                # Any use of port 80 gets redirected to https. Encrypt always.
-                if ($httpsport -and -not $request.IsSecureConnection) {
+                # Any use of port 80 gets redirected to https. 
+                if (-not $request.IsSecureConnection) {
                     Write-Verbose "Redirecting user to https"
-                    $context.Response.Redirect("$secureurl/$($url.PathAndQuery)")
+                    $context.Response.Redirect("https://$hostname/$appname/$($url.PathAndQuery)")
                     $context.Response.Close()
                     continue nextContext;
                 }  
+
                 
                 # CAS Authenticate
                 $netid = Get-CasUser $context
                 if (!$netid) {continue nextContext}  # Returned $null, Browser was redirected to the CAS Server
                  
              
+
+                # Static files (end in .html or are in the /html/ subdirectory)
+                $filename=$null
                 if ($url.Segments.Count -eq 3 -and $url.Segments[2].EndsWith('.html')) {
+                    # https://$hostname/$appname/page.html goes to /html/page.html
                     $filename = "$PSScriptRoot\html\$($url.Segments[2])"
+                } elseif ($url.Segments.Count -eq 2) {
+                    # https://$hostname/$appname goes to /html/index.html
+                    $filename = "$PSScriptRoot\html\index.html"
+                } elseif ($url.Segments.Count -eq 4 -and $($url.Segments[2] -eq "html")) {
+                    # https://$hostname/$appname/html/foo.bar goes to /html/foo.bar
+                    $filename = "$PSScriptRoot\html\$($url.Segments[3])"
+                }
+                if ($filename) {
+                    # The URL is a file request
                     if (Test-Path -Path $filename) {
                         $commandOutput=Get-Content -Path $filename |Out-String
                     } else {
@@ -170,6 +173,19 @@ function Start-CasEnabledHttpListener {
                     }
                     break;
                 }
+
+                # We want to allow forms we write to the Browser to post back data
+                # But we don't want any other application to Redirect the Browser to a REST Web call
+                # that does something using the logged in user's authority. So we check the 
+                # Http Referrer header, which must be missing (the user typed the URL in himself) or
+                # must be this machine (this data comes from a form we wrote).
+                [System.Uri] $referrer = $request.UrlReferrer
+                if ($referrer -and $url.Authority -ne $referrer.Authority) {
+                    $StatusCode = 403
+                    $commandOutput = "You were redirected from another computer. This is a security problem."
+                    break;
+                } 
+
 
                 if ($url.Segments.Count -eq 4 -and $url.Segments[2] -eq 'html') {
                     $filename = "$PSScriptRoot\html\$($url.Segments[3])"
