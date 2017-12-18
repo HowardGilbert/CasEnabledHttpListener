@@ -60,6 +60,8 @@
 # Specify your CAS server URL here
 $property_CasServerUrl = 'https://secure.its.yale.edu/cas'
 
+if (!$global:CookieName) {$CookieName='CASST'}
+
 
 
 
@@ -70,7 +72,7 @@ $property_CasServerUrl = 'https://secure.its.yale.edu/cas'
     You want to authenticate once a day and then use a Cookie to identity yourself. Security 
     will be provided if you use https encrypted transport of requests. The cookie value should
     be random and unguessable, and the CAS Service Ticket already provides these properties.
-    So it is reused as the value of the Session Cookie (named 'CASST').
+    So it is reused as the value of the Session Cookie 
     This does violate the principal that the ST is a single use value that times out immediately,
     but that was added to allow CAS clients that used plain http (no encryption).
     All sessions expire at midnight and then everyone has to relogin.
@@ -117,14 +119,14 @@ function Get-CasUser {
     # Flush the session cache first call after midnight
     if ($today -ne [DateTime]::Today) {
         # first call after midnight, flush the cache
-        $StToNetid = @{}    
-        $NetidToSt = @{}
-        $today = [DateTime]::Today
+        $script:StToNetid = @{}    
+        $script:NetidToSt = @{}
+        $script:today = [DateTime]::Today
     }
 
 
-    # Does the client have a valid Session Cookie named CASST?
-    $cookie = $request.Cookies['CASST']
+    # Does the client have a valid Session Cookie 
+    $cookie = $request.Cookies[$CookieName]
     if ($cookie) {
         $casst = $cookie.value
         Write-Verbose "Found cookie $casst"
@@ -135,7 +137,9 @@ function Get-CasUser {
             Write-Verbose "Using session for $userid"
             return $userid 
         } else {
-           Write-Verbose "Expired cookie (not found in Session table)"
+            Write-Verbose "Expired cookie (not found in Session table)"
+            $cookie.Expires = [DateTime]::now.addDays(-1)
+            $context.Response.SetCookie($cookie)
         }
     }
 
@@ -152,7 +156,7 @@ function Get-CasUser {
         # URL, so all we need to do is strip the ticket= off the end
 
         # Get the URL from the Request object
-        $uristring =$request.Url.OriginalString
+        $uristring =$request.Url.AbsoluteUri
 
         # It is always "&ticket=" or "?ticket=" that need to be stripped off
         $loc = $uristring.LastIndexOf("&ticket=")
@@ -164,6 +168,7 @@ function Get-CasUser {
             # Invoke-WebRequest opens an SSL connection to the CAS server.
             # The /serviceValidate selects CAS 2.0 protocol where the response will be simple XML
             # The data sent back (and the status and headers) is in an object
+            Write-Verbose "$property_CasServerUrl/serviceValidate?service=$casservice&ticket=$casst"
             [Microsoft.PowerShell.Commands.WebResponseObject] $casresp = Invoke-WebRequest -URI "$property_CasServerUrl/serviceValidate?service=$casservice&ticket=$casst" -UseBasicParsing
 
             if ($casresp.StatusCode -eq 200) { 
@@ -177,26 +182,30 @@ function Get-CasUser {
                     !$casXmlResponse.serviceResponse.authenticationSuccess.proxies) {
                     $userid=$casXmlResponse.serviceResponse.authenticationSuccess.user
 
-                    # Got a good login, save it in the Session Cache and write the CASST Cookie
+                    # Got a good login, save it in the Session Cache and write the Cookie
                     Write-Verbose "CAS Login from `'$userid`' with $casst"
                     if ($NetidToSt.ContainsKey($userid)){
                         # If the user already has a Session with a previous CASST, reuse it
+                        Write-Verbose "Reusing $($NetidToSt[$userid])"
                         $cookieval = $NetidToSt[$userid]
                     } else {
-                        $StToNetid[$casst]=$userid
-                        $NetidToSt[$userid]=$casst
+                        $script:StToNetid[$casst]=$userid
+                        $script:NetidToSt[$userid]=$casst
                         $cookieval = $casst
                     }
                     # Create a new CASST cookie. Will replace an old expired cookie with the same name
                     $cookie = New-Object -TypeName System.Net.Cookie
-                    $cookie.Name = 'CASST'
+                    $cookie.Name = $CookieName
                     $cookie.Value = $cookieval
                     $cookie.Discard = $true
-                    $context.Response.AppendCookie($cookie)
+                    $cookie.Path = "/$appname/"
+                    $context.Response.SetCookie($cookie)
 
-                    # The current URL has the ticket, so do one last Redirect so the end user doesn't
-                    # end up with the ticket= in the address bar (and worse, possibly in a bookmark).
-                    $context.Response.Redirect($casservice)
+                    # One last Redirect to get rid of the ticket on the command line. 
+                    # After a fresh CAS login, we can only display the home page of the application.
+                    # Any additional path or querystring information in the service= URL is suspect and could have been provided
+                    # in a Redirect by an evil third party site. 
+                    $context.Response.Redirect("/$appname/")
                     $context.Response.Close()
                     return $null
                 } else {
@@ -211,10 +220,10 @@ function Get-CasUser {
     }
 
     # So there is no Session and no valid Service Ticket. Redirect the user to CAS
-        Write-Verbose "Redirecting user to CAS"
         if ($request.HttpMethod -ne "GET") {throw "Must redirect user to CAS login, but HTTP operation is $($request.HttpMethod) instead of GET"}
-        $servicestring = [System.Uri]::EscapeUriString($request.Url.OriginalString)
+        $servicestring = [System.Uri]::EscapeUriString($request.Url.AbsoluteUri)
         $context.Response.Redirect("$property_CasServerUrl/logon?service=$servicestring")
+        Write-Verbose "Redirecting user to $property_CasServerUrl/logon?service=$servicestring"
         $context.Response.Close()
         return $null
 }

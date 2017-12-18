@@ -52,6 +52,7 @@
 #>
 
 
+
 <#
     A throwable object to generate an error HttpResponse
 #>
@@ -116,57 +117,144 @@ function Start-CasEnabledHttpListener {
 	    $listener.Start()
         $running = $true
 			
+	# Add a tag of :nextContext and then code can come back by "continue nextContext"
+	# Generally this is done on a Redirect after the Response is filled in and closed
 :nextContext while ($global:ContinueHttpProcessing) {
 				
+			# Calling GetContext() waits for a new Http request to arrive
 		    Write-Host "Thread is blocked waiting for the next Web Request."
-
-		    $statusCode = 200
-
 		    [System.Net.HttpListenerContext] $context = $listener.GetContext()
+		    
+		    # Prepare the Response for a default HTML text return
+		    $statusCode = 200
+            $context.Response.ContentType = 'text/html'
+            $BinaryFileType=$false
+            
+            # Create a global variable so the context can be found without being passed as an argument
+            # (Not actually used by any code now, but seems like a good idea in the long run)
+            # We can do this because Powershell is single threaded so there is only one Context at a time
 		    [System.Net.HttpListenerContext] $global:CasEnabledHttpListenerContext = $context
 
-            [System.Net.HttpListenerRequest] $request = $context.Request
-            [System.Uri] $url = $request.Url
+            [System.Uri] $url = $context.Request.Url
 
-            # A silly switch. The code runs until it generates a response 
-            # a break statement generates HTML text output
-            # a continue statement is used for a redirect
-
+ 
+ 
+ 			# This dummy switch encloses a block of tests. To stop processing
+ 			# and begin to generate the Response, just "break" out of the block
             switch ('only case') {
                 'only case' {
 
             
                 # Any use of port 80 gets redirected to https. 
-                if (-not $request.IsSecureConnection) {
+                if (-not $context.Request.IsSecureConnection) {
                     Write-Verbose "Redirecting user to https"
                     $context.Response.Redirect("https://$hostname/$appname/$($url.PathAndQuery)")
-                    $context.Response.Close()
-                    continue nextContext;
+                    $context.Response.Close() # Sends the Redirect back to the Browser
+                    continue nextContext; # go to start of loop and wait for next HTTP Request
                 }  
 
                 
                 # CAS Authenticate
-                $netid = Get-CasUser $context
-                if (!$netid) {continue nextContext}  # Returned $null, Browser was redirected to the CAS Server
+                $netid = Get-CasUser $context -Verbose
+                if (!$netid) {
+                	# Get-CASUser put Redirect into Response and closed it.
+                	# Go back to wait for next HTTP Request.
+                    continue nextContext
+                }  
                  
              
 
-                # Static files (end in .html or are in the /html/ subdirectory)
+                <#
+                	Handle URLs for static pages (html, css, js, etc.) in the /html/ subdirectory
+                	
+                	https://$hostname/$appname/html/*.* (any file)
+                	https://$hostname/$appname/*.html (file in /html/ subdirectory, but URL appears to be one level up) 
+                	https://$hostname/$appname (the home page, actually /html/$appname.html if it exists)
+                	
+                	Anything else is handled by DoSomething
+                #>
+                
+                # Assume not a static page unless this is set
                 $filename=$null
+                
+                # The Segments property is an array of path elements including any ending / 
+                # Segments[0] is always the "/" that follows hostname+port
+                # Segments[1] is "$appname" or "$appname/"
+                # Segments[2] if it exists is "html/", or the name of an html file, or a verb for DoSomething
+                
                 if ($url.Segments.Count -eq 3 -and $url.Segments[2].EndsWith('.html')) {
-                    # https://$hostname/$appname/page.html goes to /html/page.html
+                
+                    # https://$hostname/$appname/page.html - we send back .\html\page.html
+                    
                     $filename = "$PSScriptRoot\html\$($url.Segments[2])"
+                    
                 } elseif ($url.Segments.Count -eq 2) {
-                    # https://$hostname/$appname goes to /html/index.html
-                    $filename = "$PSScriptRoot\html\index.html"
-                } elseif ($url.Segments.Count -eq 4 -and $($url.Segments[2] -eq "html")) {
-                    # https://$hostname/$appname/html/foo.bar goes to /html/foo.bar
+                
+                	if (-not $url.Segments[1].EndsWith('/')) {
+                		# If the URL is "https://$hostname/$appname" with no ending "/" then
+                        # the Browser thinks we are in the //$hostname/* directory level. We need
+                        # the Browser to understand that we are in the //$hostname/$appname/* 
+                        # directory level, and the universally accepted way to do this is to
+                        # Redirect the browser back here adding the missing "/" on the end
+                        # of the URL.
+	                    $context.Response.Redirect("https://$hostname/$appname/")
+	                    $context.Response.Close() # Sends the Redirect back to the Browser
+	                    continue nextContext; # go to start of loop and wait for next HTTP Request
+                	}
+                
+                    # https://$hostname/$appname/ has traditionally been mapped to an index.html file. 
+                    # However, more than one $appname can share the same directory. So for us, 
+                    # the default home page is \html\$appname.html.
+                    # if that file doesn't exist, let DoSomething generate a response
+                    
+                    $homepage = "$PSScriptRoot\html\$appname.html"
+                    if (Test-Path -Path $homepage) {$filename=$homepage}
+                    
+                } elseif ($url.Segments.Count -eq 4 -and $($url.Segments[2] -eq "html/")) {
+                
+                	# Any URL in the $appname/html/ directory is what it appears to be
+                    # https://$hostname/$appname/html/foo.css goes to .\html\foo.css
                     $filename = "$PSScriptRoot\html\$($url.Segments[3])"
                 }
+
+
+                <#
+                    When the URL is https://$hostname/$appname/verb (no ending file type) then
+                    the verb is a command to send to DoSomething and let code handle it. The logic
+                    has not generated a $filename so this block does nothing. 
+
+                    If there is a $filename, then the ending file type may change the MIME string.
+
+                    There is a poor man's JSP/PHP trick. If a text (html, css, js) file begins with
+                    what Powershell calls a HereString delimiter (@") then treat it as an expression
+                    and execute it with Invoke-Expression. Just as asp and jsp pages can have embedded
+                    java code, this type of html page can have embedded $(...) Powershell expressions.
+                #>
                 if ($filename) {
-                    # The URL is a file request
+                    # If the previous logic produced a filename, send the file if it exists
                     if (Test-Path -Path $filename) {
-                        $commandOutput=Get-Content -Path $filename |Out-String
+                        # Special mime types for included files
+                        if ($filename.EndsWith('.js')) {
+            				$context.Response.ContentType = 'application/javascript'
+        				} elseif ($filename.EndsWith('.css')) {
+            				$context.Response.ContentType = 'text/css'
+        				} elseif ($filename.EndsWith('.jpg')) {
+            				$context.Response.ContentType = 'image/jpeg'
+                            $BinaryFileType=$true
+                        # Leave room here for adding other types
+                        # Remember, default is 'text/html'
+        				}
+
+                        # Get-Content returns an array of [string] for text files and of [byte] for binary files
+                        if ($BinaryFileType) {
+                            $commandOutput=Get-Content -Path $filename -Encoding Byte
+                        } else {
+                            $commandOutput=Get-Content -Path $filename |Out-String
+                            if ($commandOutput.StartsWith('@"')) {
+                                $commandOutput = Invoke-Expression -Command $commandOutput
+                            }
+                        }
+                    
                     } else {
                         $StatusCode=404
                         $commandOutput="File not found"
@@ -174,47 +262,29 @@ function Start-CasEnabledHttpListener {
                     break;
                 }
 
-                # We want to allow forms we write to the Browser to post back data
-                # But we don't want any other application to Redirect the Browser to a REST Web call
-                # that does something using the logged in user's authority. So we check the 
-                # Http Referrer header, which must be missing (the user typed the URL in himself) or
-                # must be this machine (this data comes from a form we wrote).
-                [System.Uri] $referrer = $request.UrlReferrer
+                <#
+                    A required security check. If any other computer (even CAS) redirects
+                    the user to this computer with a command URL 
+                    (https://$hostname/$appname/command?parm=value) and we execute that
+                    command, then we could be fooled into doing something under the user's
+                    authority that the user did not actually intend. We cannot allow CAS
+                    any special rights, because then someone simply redirects to CAS with
+                    a service= that points to this application and includes the command and parameters.
+                    So whenever we get a redirect or form submission from another computer, discard
+                    the command and parameters and go to the home page of this application. 
+                #>
+                [System.Uri] $referrer = $context.Request.UrlReferrer
                 if ($referrer -and $url.Authority -ne $referrer.Authority) {
-                    $StatusCode = 403
-                    $commandOutput = "You were redirected from another computer. This is a security problem."
-                    break;
+	                $context.Response.Redirect("https://$hostname/$appname/")
+	                $context.Response.Close() # Sends the Redirect back to the Browser
+	                continue nextContext; # go to start of loop and wait for next HTTP Request
                 } 
 
 
-                if ($url.Segments.Count -eq 4 -and $url.Segments[2] -eq 'html') {
-                    $filename = "$PSScriptRoot\html\$($url.Segments[3])"
-                    if (Test-Path -Path $filename) {
-                        $commandOutput=Get-Content -Path $filename |Out-String
-                    } else {
-                        $StatusCode=404
-                        $commandOutput="File not found"
-                    }
-                    break;
-                }
-               
-					
 		        try {
 
-                    if ($url.Segments.Count -eq 3 -and $url.Segments[2].EndsWith('.html')) {
-
-                        # the URL designates a file to send back
-                        $filename = "$PSScriptRoot\html\$($url.Segments[2])"
-                        if (Test-Path -Path $filename) {
-                            $commandOutput=Get-Content -Path $filename |Out-String
-                        } else {
-                            $StatusCode=404
-                            $commandOutput="File not found"
-                        }
-                    } else {
-                        # Call the Business Logic function to process the request
-			            $commandOutput = DoSomething $context $netid
-                    }
+                    # Call the Business Logic function to process the request
+			        $commandOutput = DoSomething $context $netid
 		        }
  		        catch {
                     # If you throw an object (an HttpError), then $_ is an ErrorRecord 
@@ -239,16 +309,20 @@ function Start-CasEnabledHttpListener {
  			
             if ($commandOutput -eq $null) {
                 # if DoSomething returns $null, then it put everthing in the Response object
-                # already and closed it. We do nothing execept to call GetContext() again.
+                # already and closed it. We do nothing except to call GetContext() again.
                 continue
             }
 
 		    [System.Net.HttpListenerResponse]$response = $context.Response
 
 		    $response.StatusCode = $statusCode
-            $response.ContentType = 'text/html'
-
-		    $buffer = [System.Text.Encoding]::UTF8.GetBytes("$commandOutput")
+            
+            if (-not $BinaryFileType) {
+                $responseText = $commandOutput|Out-String
+		        $buffer = [System.Text.Encoding]::UTF8.GetBytes($responseText)
+            } else {
+                $buffer = $commandOutput
+            }
 		    $response.ContentLength64 = $buffer.Length
 
 		    $output = $response.OutputStream
