@@ -1,111 +1,67 @@
 ﻿<#
-    A basic CAS Client written in PowerShell useful for Web Services based on an HttpListener.
+    A basic CAS Client written in PowerShell for Web Services based on an HttpListener.
 
-    This is basically the textbook standard CAS Client code expressed in Powershell.
+    This is basically the standard CAS Client code expressed in Powershell.
     You can write the same code in any other programming language.
 
-    This code functions with any Powershell script that uses the HttpListener class to create
-    a Web Server. HttpListener supports other forms of Authentication, but to use CAS you
-    disable the .NET authentication options and use this module. 
-
-    The textbook use of HttpListener from Powershell looks something like this:
-
-    $listener = New-Object System.Net.HttpListener
-    $listener.Prefixes.Add("https://*:5150/$appname/")
-    $listener.IgnoreWriteExceptions=$true
-    $listener.AuthenticationSchemes = [System.Net.AuthenticationSchemes]::Anonymous
-	$listener.Start()
-	while ($true) {
-		$context = $listener.GetContext()
-        $netid = Get-CasUser $context
-        if (!$netid) {continue}
-
-        ... # do stuff
-    }
-
-    If you want information on the other parameters of $listener, look them up elsewhere
-    because this module is only about CAS. Setting the Anonymous AuthenticationScheme 
-    tells the Listener to do no authentication itself. Then this code takes over.
-
-    $listener.GetContext() waits for an HTTP request (GET or POST) to arrive. You have
-    to decide if the request requires CAS authentication. It is really hard to authenticate
-    a POST because you have to save the data somewhere, so typically you only expect to
-    authenticate on a GET where the only data is in the URL.
-
-    When you need a netid, call Get-CasUser passing the $context you got back from GetContext().
-    If there are some functions that do not require authentication (like an initial greeting page
-    or a menu of options) then call Get-CasUser only for requests that need it. 
-
-    However, you have to make up your mind before you start putting data in the Response object. 
-    You cannot begin to write stuff back to the user, then change your mind and decide to redirect
-    to CAS. 
-
-    In Get-CasUser:
-    If you already authenticated, the Netid is passed back from the table of users.
-    The first time you authenticate, this code redirects the browser to the CAS login page.
-    The next $context that comes back from CAS contains the Service Ticket string that can be
-    validated to get the Netid.
-
-    In the middle case, where this code changes the Response object to redirect to CAS, 
-    this function returns $null. As shown above, when you get back $null from the function
-    call, continue to the end of the loop and go back to GetContext() to receive the 
-    Request when CAS redirects the browser back here.
+    This code accompanies the CasEnabledHttpListener module, which provides an example
+    of binding to a URL, waiting for a context, then calling this code.
     
-    After getting and validating a ticket, this module writes a cookie to the Browser and
-    maintains a lookup table associating that cookie to the Netid. 
 #>
 
+# Caller can provide required configuration with Import-Module -ArgumentList localhost,myapp
+param (
+	[string] $hostname, 
+	[string] $appname
+)
 
-# CONFIGURE THIS MODULE
-# Specify your CAS server URL here
+# You can have many applications, but there is only one CAS server on your campus
 $property_CasServerUrl = 'https://secure.its.yale.edu/cas'
 
-if (!$global:CookieName) {$CookieName='CASST'}
+# More than one app can run on a server, so include the appname in the Cookie name.
+# so each application has its own Session.
+$CookieName = $appname.toUpper()+'-CASST'
 
-
-
-
+$CookieValue = $null
 
 <# 
     Simple Session Cache
-
-    You want to authenticate once a day and then use a Cookie to identity yourself. Security 
-    will be provided if you use https encrypted transport of requests. The cookie value should
-    be random and unguessable, and the CAS Service Ticket already provides these properties.
-    So it is reused as the value of the Session Cookie 
-    This does violate the principal that the ST is a single use value that times out immediately,
-    but that was added to allow CAS clients that used plain http (no encryption).
-    All sessions expire at midnight and then everyone has to relogin.
-    If you want sometime better, replace this code with something bigger. 
+    
+    Create two hashtables to map Cookie value to Netid and Netid to a Cookie value.
+    The second table is optional, but keeps the number of entries in the Cache low
+    if someone drops Cookies all the time. Use the CAS Service Ticket as the Cookie value.
+    Expire the cache at midnight each day (feel free to recode for a shorter session time).
 #>
 $StToNetid = @{}    # given an ST, return the netid
-$NetidToSt = @{}    # given an netid, return an existing ST
+$NetidToSt = @{}    # given an netid, return a previous ST
 $today = [DateTime]::Today  # At midnight, flush the cache
 
 
+
+
+
+
 <#
+.SYNOPSIS
+	Get Netid from session or from CAS
+.DESCRIPTION
     Get-CasUser is called from a main script after calling HttpListener.getContext().
     It would never be typed into a command prompt. 
     
-    The argument is the HttpListenerContext object that points to the Request and Response objects.
-
     The logic is standard "CAS Client"
 
         If there is a Cookie indicating a session with this browser, return the Netid from the session.
         If there is a ticket=, validate it to the CAS Server and store the Netid returned in a new session
         Otherwise, redirect to CAS login.
-    
-    The returned value is the Netid, or $null if we set up the Response object to redirect to CAS login.
+.PARAMETER Context
+ 	[HttpListenerContext] returned by calling $listener.getContext()       
+.OUTPUT    
+    [string] $Netid, or $null if we set up the Response object to redirect to CAS login.
 #>
 function Get-CasUser {
-    # Adding the CmdletBinding gives us access to -Verbose and other useful tools.
-    [CmdletBinding()]
-    param(
-        # Caller must pass an object returned by $listener.GetContext()
-        # The HttpListenerContext contains one Http request (a GET or PUT for example).
-        # from the context you can get a Request and Response object just like every other
-        # Web application API has. 
 
+    [CmdletBinding()] # Allow -Verbose
+    param(
         [Parameter(Mandatory=$true)]
         [System.Net.HttpListenerContext] $context
     )
@@ -135,11 +91,12 @@ function Get-CasUser {
         if ($StToNetid.containsKey($casst) ){
             $userid = $StToNetid[$casst]
             Write-Verbose "Using session for $userid"
+            $script:CookieValue = $casst
             return $userid 
         } else {
             Write-Verbose "Expired cookie (not found in Session table)"
-            $cookie.Expires = [DateTime]::now.addDays(-1)
-            $context.Response.SetCookie($cookie)
+            # This is the only reliable way to set/update/delete Cookies with HttpListener
+            $context.Response.Headers.Add('Set-Cookie',"$CookieName=Deleted;Path=/$appname;Secure;HttpOnly;Max-Age=0")
         }
     }
 
@@ -193,13 +150,8 @@ function Get-CasUser {
                         $script:NetidToSt[$userid]=$casst
                         $cookieval = $casst
                     }
-                    # Create a new CASST cookie. Will replace an old expired cookie with the same name
-                    $cookie = New-Object -TypeName System.Net.Cookie
-                    $cookie.Name = $CookieName
-                    $cookie.Value = $cookieval
-                    $cookie.Discard = $true
-                    $cookie.Path = "/$appname/"
-                    $context.Response.SetCookie($cookie)
+            		# This is the only reliable way to set/update/delete Cookies with HttpListener
+        			$context.Response.Headers.Add('Set-Cookie',"$CookieName=$Cookieval;Path=/$appname;Secure;HttpOnly")
 
                     # One last Redirect to get rid of the ticket on the command line. 
                     # After a fresh CAS login, we can only display the home page of the application.
@@ -227,3 +179,25 @@ function Get-CasUser {
         $context.Response.Close()
         return $null
 }
+
+
+
+
+function Test-CSRFTokenValue {
+
+	param ([string] $CSRFToken)
+
+	return ($CSRFToken -eq $CookieValue)
+} 
+
+function Get-CSRFTokenValue {
+
+	return $CookieValue
+} 
+
+function Get-CSRFTokenElement {
+
+	return @"
+	<input type='hidden' name='CSRFToken' value='$CookieValue' />
+"@
+} 
