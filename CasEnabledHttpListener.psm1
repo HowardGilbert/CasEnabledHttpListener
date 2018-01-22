@@ -232,13 +232,13 @@ function Start-CasEnabledHttpListener {
 						elseif ($context.Request.HttpMethod -eq 'GET') {
 							# HttpListener has parsed the QueryString, so just copy it over
 							foreach ($key in $context.Request.QueryString.AllKeys) {
-								$RequestParameters[$key] = $request.QueryString[$key]
+								$RequestParameters[$key] = $context.Request.QueryString[$key]
 							}
 						}
 						
 						# Require forms to have the CSRFToken because Referer and Origin don't always work
 						$CSRFToken = $RequestParameters['CSRFToken']
-						if (!$CSRFToken -or -not (Test-CSRFToken $CSRFToken)) {
+						if (!$CSRFToken -or -not (Test-CSRFTokenValue $CSRFToken)) {
 							throw New-HttpError "BadRequest" "Form did not contain a CSRFToken from this computer"
 						}
 						
@@ -413,7 +413,8 @@ function Get-ContentFromFile {
 			}
 			catch {
 				# The page contained a Powershell error. 
-				$commandOutput = "Error during execution of the $filename. Report the following error:<br> $_"
+				$commandOutput = "Error during execution of the $filename. Report the following error:<br> $_ 
+                $($_.ScriptStackTrace)"
 			}
 		}
 		else {
